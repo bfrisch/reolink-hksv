@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+config.yaml
+*.log
+.DS_Store
+.tools/
+

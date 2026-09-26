@@ -1,0 +1,35 @@
+# Copy to config.yaml and fill in your cameras.
+# Passwords should be alphanumeric — Reolink RTSP often fails with symbols.
+#
+# HomeKit only accepts H.264. HEVC from the camera is decoded and encoded
+# on the GPU when possible:
+#   nvidia → NVDEC + NVENC
+#   amd    → VAAPI
+#   intel  → Quick Sync (QSV), else VAAPI
+
+storageDir: ./data
+ffmpegPath: ffmpeg
+verboseFfmpeg: false
+motionPollMs: 1500
+motionHoldMs: 20000
+
+# auto | nvidia | amd | intel | none
+hwaccel: auto
+# Used for AMD VAAPI and Intel QSV/VAAPI
+vaapiDevice: /dev/dri/renderD128
+
+cameras:
+  - name: Front Door
+    host: 192.168.1.80
+    port: 80
+    username: admin
+    password: changeme
+    channel: 0
+    rtspPort: 554
+    videoStream: main
+    sourceCodec: hevc
+    liveCodec: transcode
+    audio: true
+    # ONVIF GetStreamUri is used to find the RTSP path (port 8000 on most Reolink)
+    onvif: true
+    onvifPort: 8000
