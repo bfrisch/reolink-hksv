@@ -5,6 +5,16 @@ interface TokenValue {
   Token?: { name: string; leaseTime?: number };
 }
 
+/** Device info from Reolink `GetDevInfo`. */
+export type DevInfo = {
+  firmVer?: string;
+  model?: string;
+  serial?: string;
+  name?: string;
+  hardVer?: string;
+  [key: string]: unknown;
+};
+
 export class ReolinkClient {
   private token?: string;
   private tokenUntil = 0;
@@ -64,9 +74,9 @@ export class ReolinkClient {
     return row.value as T;
   }
 
-  async deviceInfo(): Promise<Record<string, unknown>> {
-    const value = await this.cmd<{ DevInfo?: Record<string, unknown> }>("GetDevInfo");
-    return value.DevInfo ?? (value as Record<string, unknown>);
+  async deviceInfo(): Promise<DevInfo> {
+    const value = await this.cmd<{ DevInfo?: DevInfo }>("GetDevInfo");
+    return value.DevInfo ?? (value as DevInfo);
   }
 
   async motionActive(): Promise<boolean> {
