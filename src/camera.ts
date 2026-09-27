@@ -333,6 +333,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
       height: video.height,
       fps: video.fps,
       bitRateKbps: video.max_bit_rate,
+      purpose: "live",
     });
     const videoCodec = copyOk ? ["-codec:v", "copy"] : h264EncodeArgs(opts);
 
