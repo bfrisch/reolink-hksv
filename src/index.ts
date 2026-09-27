@@ -60,7 +60,15 @@ async function start(configPath: string): Promise<void> {
       accessory.applyDeviceInfo(info);
       log.info(`${cam.name}: logged in (${JSON.stringify(info)})`);
     } catch (err) {
-      log.warn(`${cam.name}: could not reach camera yet: ${String(err)}`);
+      for (const published of cameras) {
+        try {
+          await published.unpublish();
+        } catch {
+          // ignore
+        }
+      }
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`${cam.name}: Reolink API connection failed: ${detail}`);
     }
     try {
       const stream = await resolveRtspUrl(config.ffmpegPath, cam);
