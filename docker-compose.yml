@@ -4,7 +4,7 @@
 services:
   reolink-hksv:
     build: .
-    image: reolink-hksv:latest
+    image: ghcr.io/bfrisch/reolink-hksv:latest
     container_name: reolink-hksv
     network_mode: host
     restart: unless-stopped

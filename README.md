@@ -15,14 +15,19 @@ Each camera is a separate HomeKit accessory (not a bridge). Pair them one by one
 
 ## Run with Docker
 
+Images are published to GitHub Container Registry: `ghcr.io/bfrisch/reolink-hksv:latest`.
+
 Host networking is required so Apple devices can find the accessories over mDNS.
 
 ```bash
 cp config.example.yaml config.yaml
 # set host, username, password
+
+docker compose pull
+docker compose up -d
 ```
 
-**AMD or Intel** (exposes `/dev/dri`):
+To build locally instead:
 
 ```bash
 docker compose up --build -d

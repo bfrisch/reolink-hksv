@@ -1,5 +1,9 @@
 FROM node:22-bookworm-slim
 
+LABEL org.opencontainers.image.source="https://github.com/bfrisch/reolink-hksv" \
+      org.opencontainers.image.description="Connect Reolink cameras to HomeKit Secure Video" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
