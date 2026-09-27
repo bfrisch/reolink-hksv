@@ -21,6 +21,8 @@ vaapiDevice: /dev/dri/renderD128
 cameras:
   - name: Front Door
     host: 192.168.1.80
+    # Use HTTPS for login, snapshots, and motion/AI (defaults port to 443)
+    https: false
     port: 80
     username: admin
     password: changeme
