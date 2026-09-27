@@ -57,6 +57,7 @@ async function start(configPath: string): Promise<void> {
     try {
       await accessory.client.login();
       const info = await accessory.client.deviceInfo();
+      accessory.applyDeviceInfo(info);
       log.info(`${cam.name}: logged in (${JSON.stringify(info)})`);
     } catch (err) {
       log.warn(`${cam.name}: could not reach camera yet: ${String(err)}`);

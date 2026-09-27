@@ -36,7 +36,7 @@ import { ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, srtpParam } from ".
 import type { AccessoryIdentity } from "./identities.js";
 import { log } from "./logger.js";
 import { RecordingPrebuffer } from "./prebuffer.js";
-import { ReolinkClient } from "./reolink.js";
+import { type DevInfo, ReolinkClient } from "./reolink.js";
 
 type SessionInfo = {
   address: string;
@@ -175,6 +175,14 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     });
 
     this.accessory.configureController(this.controller);
+  }
+
+  /** Apply camera identity fields from Reolink `GetDevInfo` (e.g. firmware). */
+  applyDeviceInfo(info: DevInfo): void {
+    const service = this.accessory.getService(Service.AccessoryInformation)!;
+    if (typeof info.firmVer === "string" && info.firmVer.length > 0) {
+      service.updateCharacteristic(Characteristic.FirmwareRevision, info.firmVer);
+    }
   }
 
   async publish(): Promise<void> {
