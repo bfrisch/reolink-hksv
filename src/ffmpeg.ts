@@ -163,6 +163,9 @@ export function srtpParam(keyAndSalt: Buffer): string {
   return keyAndSalt.toString("base64");
 }
 
+/** Live needs low latency; Secure Video recording can spend more on quality. */
+export type EncodePurpose = "live" | "record";
+
 export interface TranscodeOpts {
   url: string;
   verbose: boolean;
@@ -177,6 +180,7 @@ export interface TranscodeOpts {
   level?: string;
   iframeSec?: number;
   vaapiDevice?: string;
+  purpose?: EncodePurpose;
 }
 
 export function ffmpegInputArgs(opts: Pick<TranscodeOpts, "url" | "verbose" | "accel" | "caps" | "sourceCodec" | "vaapiDevice">): string[] {
@@ -234,25 +238,37 @@ export function h264EncodeArgs(opts: TranscodeOpts): string[] {
   const gop = Math.max(1, Math.round(opts.fps * (opts.iframeSec ?? 2)));
   const profile = opts.profile ?? "high";
   const level = opts.level ?? "4.0";
+  const record = opts.purpose === "record";
+  // HomeKit bitrates are often tight for HEVC→H.264; give recording more headroom.
+  const bitRateKbps = record ? Math.round(opts.bitRateKbps * 1.5) : opts.bitRateKbps;
+  const bufsize = `${bitRateKbps * 4}k`;
+  const maxrate = `${bitRateKbps}k`;
 
   if (opts.accel === "nvenc") {
-    return [
+    // p4/p5 + VBR/CQ beat the old p1/CBR path for detail while staying real-time on GPU.
+    const args = [
       "-vf",
       `scale_cuda=${w}:${h}:interp_algo=lanczos`,
       "-codec:v",
       "h264_nvenc",
       "-preset",
-      "p1",
+      record ? "p5" : "p4",
       "-tune",
-      "ll",
+      record ? "hq" : "ll",
       "-rc",
-      "cbr",
+      "vbr",
+      "-cq",
+      record ? "19" : "23",
       "-b:v",
-      `${opts.bitRateKbps}k`,
+      maxrate,
       "-maxrate",
-      `${opts.bitRateKbps}k`,
+      maxrate,
       "-bufsize",
-      `${opts.bitRateKbps * 2}k`,
+      bufsize,
+      "-spatial-aq",
+      "1",
+      "-temporal-aq",
+      "1",
       "-profile:v",
       profile,
       "-level",
@@ -264,18 +280,23 @@ export function h264EncodeArgs(opts: TranscodeOpts): string[] {
       "-delay",
       "0",
     ];
+    if (record) {
+      args.push("-rc-lookahead", "20", "-multipass", "fullres");
+    }
+    return args;
   }
 
   if (opts.accel === "vaapi") {
+    // CQP keeps more detail than the old hard CBR path (lower qp = higher quality).
     return [
       "-vf",
       `scale_vaapi=w=${w}:h=${h}:format=nv12`,
       "-codec:v",
       "h264_vaapi",
-      "-b:v",
-      `${opts.bitRateKbps}k`,
-      "-maxrate",
-      `${opts.bitRateKbps}k`,
+      "-rc_mode",
+      "CQP",
+      "-qp",
+      record ? "20" : "24",
       "-bf",
       "0",
       "-g",
@@ -292,11 +313,17 @@ export function h264EncodeArgs(opts: TranscodeOpts): string[] {
       "-codec:v",
       "h264_qsv",
       "-preset",
-      "veryfast",
+      record ? "medium" : "fast",
+      "-global_quality",
+      record ? "20" : "23",
+      "-look_ahead",
+      record ? "1" : "0",
       "-b:v",
-      `${opts.bitRateKbps}k`,
+      maxrate,
       "-maxrate",
-      `${opts.bitRateKbps}k`,
+      maxrate,
+      "-bufsize",
+      bufsize,
       "-g",
       String(gop),
       "-bf",
@@ -306,25 +333,26 @@ export function h264EncodeArgs(opts: TranscodeOpts): string[] {
     ];
   }
 
+  // Constrained CRF: quality-first, capped by HomeKit's bitrate.
   const args = [
     "-codec:v",
     "libx264",
     "-pix_fmt",
     "yuv420p",
     "-preset",
-    "ultrafast",
+    record ? "veryfast" : "superfast",
     "-tune",
-    "zerolatency",
+    record ? "film" : "zerolatency",
     "-profile:v",
     profile,
     "-level:v",
     level,
-    "-b:v",
-    `${opts.bitRateKbps}k`,
+    "-crf",
+    record ? "18" : "21",
     "-maxrate",
-    `${opts.bitRateKbps}k`,
+    maxrate,
     "-bufsize",
-    `${opts.bitRateKbps * 2}k`,
+    bufsize,
     "-r",
     String(opts.fps),
     "-vf",
@@ -357,6 +385,7 @@ export function makeTranscodeOpts(
     profile?: string;
     level?: string;
     iframeSec?: number;
+    purpose?: EncodePurpose;
   },
 ): TranscodeOpts {
   return {
@@ -367,6 +396,7 @@ export function makeTranscodeOpts(
     sourceCodec: cam.sourceCodec,
     vaapiDevice: app.vaapiDevice,
     ...extra,
+    purpose: extra.purpose ?? (extra.iframeSec ? "record" : "live"),
   };
 }
 

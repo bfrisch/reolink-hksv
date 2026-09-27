@@ -142,6 +142,7 @@ export class RecordingPrebuffer {
       profile,
       level,
       iframeSec,
+      purpose: "record",
     });
 
     return [
