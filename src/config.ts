@@ -9,6 +9,8 @@ export type HwAccel = "auto" | "nvidia" | "amd" | "intel" | "nvenc" | "vaapi" | 
 export interface CameraConfig {
   name: string;
   host: string;
+  /** Use HTTPS for the local Reolink API (login, snapshots, motion). */
+  https: boolean;
   port: number;
   username: string;
   password: string;
@@ -36,7 +38,9 @@ export interface AppConfig {
 }
 
 const defaults = {
+  https: false,
   port: 80,
+  httpsPort: 443,
   channel: 0,
   rtspPort: 554,
   videoStream: "main" as VideoStreamName,
@@ -62,23 +66,27 @@ export function loadConfig(path: string): AppConfig {
     motionHoldMs: raw.motionHoldMs ?? 20_000,
     hwaccel: raw.hwaccel ?? "auto",
     vaapiDevice: raw.vaapiDevice ?? "/dev/dri/renderD128",
-    cameras: raw.cameras.map((cam) => ({
-      name: cam.name,
-      host: cam.host,
-      port: cam.port ?? defaults.port,
-      username: cam.username ?? "admin",
-      password: String(cam.password ?? ""),
-      channel: cam.channel ?? defaults.channel,
-      rtspPort: cam.rtspPort ?? defaults.rtspPort,
-      videoStream: cam.videoStream ?? defaults.videoStream,
-      liveCodec: cam.liveCodec ?? defaults.liveCodec,
-      sourceCodec: cam.sourceCodec ?? defaults.sourceCodec,
-      audio: cam.audio ?? defaults.audio,
-      onvif: cam.onvif ?? true,
-      onvifPort: cam.onvifPort,
-      rtspUrl: cam.rtspUrl,
-      snapshotUrl: cam.snapshotUrl,
-    })),
+    cameras: raw.cameras.map((cam) => {
+      const https = cam.https ?? defaults.https;
+      return {
+        name: cam.name,
+        host: cam.host,
+        https,
+        port: cam.port ?? (https ? defaults.httpsPort : defaults.port),
+        username: cam.username ?? "admin",
+        password: String(cam.password ?? ""),
+        channel: cam.channel ?? defaults.channel,
+        rtspPort: cam.rtspPort ?? defaults.rtspPort,
+        videoStream: cam.videoStream ?? defaults.videoStream,
+        liveCodec: cam.liveCodec ?? defaults.liveCodec,
+        sourceCodec: cam.sourceCodec ?? defaults.sourceCodec,
+        audio: cam.audio ?? defaults.audio,
+        onvif: cam.onvif ?? true,
+        onvifPort: cam.onvifPort,
+        rtspUrl: cam.rtspUrl,
+        snapshotUrl: cam.snapshotUrl,
+      };
+    }),
   };
 }
 

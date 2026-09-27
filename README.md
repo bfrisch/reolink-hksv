@@ -50,7 +50,7 @@ The log prints a PIN and QR code per camera. In the Home app: **Add Accessory** 
 ## Camera settings
 
 1. Letters-and-numbers-only password (symbols often break RTSP).
-2. Enable RTSP and HTTP.
+2. Enable RTSP and HTTP (or HTTPS) on the camera.
 3. Leave the camera on H.265 if that is all it offers.
 4. Prefer `videoStream: main`. Override `rtspUrl` if needed, e.g. `rtsp://user:pass@ip:554/h265Preview_01_main`.
 
@@ -60,6 +60,8 @@ The log prints a PIN and QR code per camera. In the Home app: **Add Accessory** 
 | --- | --- |
 | `hwaccel` | `auto` (default), `nvidia`, `amd`, `intel`, or `none` |
 | `vaapiDevice` | Render node for AMD/Intel, default `/dev/dri/renderD128` |
+| `https` | Use HTTPS for the local Reolink API (default `false`; defaults `port` to `443` when true) |
+| `port` | API port (default `80`, or `443` when `https: true`) |
 | `sourceCodec` | `hevc` (default), `h264`, or `auto` |
 | `liveCodec` | `transcode` (default) or `copy` (H.264 only) |
 | `videoStream` | `main` (default), `sub`, or `ext` |
@@ -76,12 +78,14 @@ Needs Node.js 20+ and ffmpeg with HEVC decode plus one of `h264_nvenc`, `h264_va
 ```bash
 npm install
 npx tsx src/index.ts probe --host 192.168.1.80 --password YOURPASS
+# HTTPS API (self-signed certs are accepted):
+npx tsx src/index.ts probe --host 192.168.1.80 --password YOURPASS --https
 npx tsx src/index.ts start
 ```
 
 ## How it works
 
-1. Local Reolink HTTP API for login, snapshots, and motion/AI state.
+1. Local Reolink HTTP(S) API for login, snapshots, and motion/AI state.
 2. ONVIF `GetStreamUri` for the RTSP URL (then ffmpeg pulls that stream).
 3. GPU (or CPU) HEVC → H.264 for live SRTP and HKSV fMP4.
 4. Motion characteristic so the Apple hub starts a Secure Video clip.

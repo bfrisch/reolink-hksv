@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import type { CameraConfig } from "./config.js";
 import { log } from "./logger.js";
 
@@ -15,6 +17,66 @@ export type DevInfo = {
   [key: string]: unknown;
 };
 
+interface CameraResponse {
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+/** Local Reolink APIs often use self-signed TLS; do not reject those certs. */
+const insecureHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+async function cameraFetch(
+  url: string,
+  init: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<CameraResponse> {
+  const parsed = new URL(url);
+  const isHttps = parsed.protocol === "https:";
+  const lib = isHttps ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const req = lib.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: init.method ?? "GET",
+        headers: init.headers,
+        agent: isHttps ? insecureHttpsAgent : undefined,
+        signal: init.signal,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          const status = res.statusCode ?? 0;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            async json() {
+              return JSON.parse(buf.toString("utf8")) as unknown;
+            },
+            async arrayBuffer() {
+              return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+            },
+          });
+        });
+      },
+    );
+    req.on("error", reject);
+    if (init.body) req.write(init.body);
+    req.end();
+  });
+}
+
 export class ReolinkClient {
   private token?: string;
   private tokenUntil = 0;
@@ -22,7 +84,8 @@ export class ReolinkClient {
   constructor(private readonly cam: CameraConfig) {}
 
   private base(): string {
-    return `http://${this.cam.host}:${this.cam.port}`;
+    const scheme = this.cam.https ? "https" : "http";
+    return `${scheme}://${this.cam.host}:${this.cam.port}`;
   }
 
   async login(): Promise<void> {
@@ -33,7 +96,7 @@ export class ReolinkClient {
         param: { User: { userName: this.cam.username, password: this.cam.password } },
       },
     ];
-    const res = await fetch(url, {
+    const res = await cameraFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -58,7 +121,7 @@ export class ReolinkClient {
   async cmd<T = unknown>(cmd: string, param: Record<string, unknown> = {}): Promise<T> {
     const token = await this.ensureToken();
     const url = `${this.base()}/cgi-bin/api.cgi?cmd=${encodeURIComponent(cmd)}&token=${encodeURIComponent(token)}`;
-    const res = await fetch(url, {
+    const res = await cameraFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify([{ cmd, action: 0, param }]),
@@ -115,7 +178,7 @@ export class ReolinkClient {
     const url =
       this.cam.snapshotUrl ??
       `${this.base()}/cgi-bin/api.cgi?cmd=Snap&channel=${this.cam.channel}&rs=${Date.now()}&token=${encodeURIComponent(token)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const res = await cameraFetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`Snapshot HTTP ${res.status} for ${this.cam.name}`);
     return Buffer.from(await res.arrayBuffer());
   }

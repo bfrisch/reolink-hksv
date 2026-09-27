@@ -90,11 +90,20 @@ async function start(configPath: string): Promise<void> {
   process.on("SIGTERM", () => void shutdown());
 }
 
-async function probe(opts: { host: string; username: string; password: string; port: string; channel: string }): Promise<void> {
+async function probe(opts: {
+  host: string;
+  username: string;
+  password: string;
+  port?: string;
+  https?: boolean;
+  channel: string;
+}): Promise<void> {
+  const https = Boolean(opts.https);
   const cam: CameraConfig = {
     name: opts.host,
     host: opts.host,
-    port: Number(opts.port),
+    https,
+    port: opts.port !== undefined ? Number(opts.port) : https ? 443 : 80,
     username: opts.username,
     password: opts.password,
     channel: Number(opts.channel),
@@ -143,7 +152,8 @@ program
   .requiredOption("--host <ip>")
   .option("--username <user>", "username", "admin")
   .requiredOption("--password <password>")
-  .option("--port <port>", "HTTP port", "80")
+  .option("--https", "use HTTPS for the local Reolink API (default port 443)")
+  .option("--port <port>", "API port (default 80, or 443 with --https)")
   .option("--channel <n>", "NVR channel (0-based)", "0")
   .action((opts) => probe(opts));
 
