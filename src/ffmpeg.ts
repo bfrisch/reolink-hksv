@@ -179,8 +179,32 @@ export interface TranscodeOpts {
   vaapiDevice?: string;
 }
 
-export function ffmpegInputArgs(opts: Pick<TranscodeOpts, "url" | "verbose" | "accel" | "caps" | "sourceCodec" | "vaapiDevice">): string[] {
+/** How long ffmpeg may inspect the RTSP input before it emits frames. */
+export type RecordingStartup = "fast" | "stable";
+
+/**
+ * Short probe for a recording encoder started at motion time.
+ * The stable probe is the fallback when the short one never produces an init segment.
+ */
+export function chooseRecordingStartup(previous: RecordingStartup, producedInitialization: boolean): RecordingStartup {
+  if (previous === "fast" && !producedInitialization) return "stable";
+  return previous;
+}
+
+const INPUT_PROBE: Record<RecordingStartup, { probesize: string; analyzeduration: string }> = {
+  // 2s / 4MB is enough for a Reolink GOP and much shorter than the 10s live probe.
+  fast: { probesize: "4M", analyzeduration: "2000000" },
+  stable: { probesize: "32M", analyzeduration: "10M" },
+};
+
+export function ffmpegInputArgs(
+  opts: Pick<TranscodeOpts, "url" | "verbose" | "accel" | "caps" | "sourceCodec" | "vaapiDevice"> & {
+    startup?: RecordingStartup;
+  },
+): string[] {
   const hevc = opts.sourceCodec !== "h264";
+  const startup = opts.startup ?? "stable";
+  const probe = INPUT_PROBE[startup];
   const args = [
     "-hide_banner",
     "-loglevel",
@@ -215,16 +239,15 @@ export function ffmpegInputArgs(opts: Pick<TranscodeOpts, "url" | "verbose" | "a
     "-rtsp_transport",
     "tcp",
     "-fflags",
-    "+genpts+discardcorrupt+nobuffer",
+    startup === "fast" ? "+genpts+discardcorrupt+nobuffer+flush_packets" : "+genpts+discardcorrupt+nobuffer",
     "-flags",
     "low_delay",
-    "-probesize",
-    "32M",
-    "-analyzeduration",
-    "10M",
-    "-i",
-    opts.url,
   );
+  if (startup === "fast") {
+    // Don't hold decoded frames in the demuxer while the hub is waiting on the first fragment.
+    args.push("-max_delay", "0", "-fpsprobesize", "0");
+  }
+  args.push("-probesize", probe.probesize, "-analyzeduration", probe.analyzeduration, "-i", opts.url);
   return args;
 }
 
