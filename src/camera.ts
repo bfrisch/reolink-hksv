@@ -81,6 +81,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   private motion = false;
   private lastMotionAt = 0;
   private recordingActive = false;
+  private recordingConfig?: CameraRecordingConfiguration;
   private pollTimer?: NodeJS.Timeout;
 
   constructor(
@@ -273,11 +274,15 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   updateRecordingActive(active: boolean): void {
     this.recordingActive = active;
     log.info(`${this.cam.name}: HomeKit Secure Video recording ${active ? "enabled" : "disabled"}`);
-    if (!active) this.prebuffer.stop();
+    this.applyRecordingConfiguration(active ? this.recordingConfig : undefined);
   }
 
   updateRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
-    void this.prebuffer.setConfiguration(this.recordingActive ? configuration : undefined);
+    this.recordingConfig = configuration;
+    // HomeKit often writes the selected configuration before Active=1. Keep it so the
+    // encoder can start as soon as recording is actually enabled.
+    if (!this.recordingActive) return;
+    this.applyRecordingConfiguration(configuration);
   }
 
   async *handleRecordingStreamRequest(streamId: number, signal?: AbortSignal): AsyncGenerator<RecordingPacket> {
@@ -288,6 +293,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
 
     try {
       const sub = this.prebuffer.subscribe();
+      await this.prebuffer.ensureRunning();
       let sentInit = false;
       const idleAfter = this.app.motionHoldMs;
 
@@ -441,12 +447,21 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
         if (active) this.lastMotionAt = Date.now();
         const held = Date.now() - this.lastMotionAt < this.app.motionHoldMs;
         const next = active || held;
-        if (next !== this.motion) {
-          this.motion = next;
-          this.accessory
-            .getService(Service.MotionSensor)
-            ?.updateCharacteristic(Characteristic.MotionDetected, next);
-          log.info(`${this.cam.name}: motion ${next ? "detected" : "cleared"}`);
+        if (next && !this.motion) {
+          // Claim the edge before awaiting so a second poll cannot publish motion first.
+          this.motion = true;
+          try {
+            // Spawn ffmpeg before HomeKit is told, so the hub's recording open is not a cold start.
+            await this.prebuffer.ensureRunning();
+          } catch (err) {
+            log.warn(`${this.cam.name}: recording stream launch failed: ${String(err)}`);
+          }
+          this.accessory.getService(Service.MotionSensor)?.updateCharacteristic(Characteristic.MotionDetected, true);
+          log.info(`${this.cam.name}: motion detected`);
+        } else if (!next && this.motion) {
+          this.motion = false;
+          this.accessory.getService(Service.MotionSensor)?.updateCharacteristic(Characteristic.MotionDetected, false);
+          log.info(`${this.cam.name}: motion cleared`);
         }
       } catch (err) {
         log.warn(`${this.cam.name}: motion poll failed: ${String(err)}`);
@@ -454,5 +469,11 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     };
     void tick();
     this.pollTimer = setInterval(() => void tick(), this.app.motionPollMs);
+  }
+
+  private applyRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
+    void this.prebuffer.setConfiguration(configuration).catch((err: unknown) => {
+      log.warn(`${this.cam.name}: recording encoder failed to start: ${String(err)}`);
+    });
   }
 }
