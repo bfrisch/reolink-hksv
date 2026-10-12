@@ -88,4 +88,4 @@ npx tsx src/index.ts start
 1. Local Reolink HTTP(S) API for login, snapshots, and motion/AI state.
 2. ONVIF `GetStreamUri` for the RTSP URL (then ffmpeg pulls that stream).
 3. GPU (or CPU) HEVC → H.264 for live SRTP and HKSV fMP4.
-4. Motion characteristic so the Apple hub starts a Secure Video clip.
+4. Motion characteristic so the Apple hub starts a Secure Video clip. The recording encoder is started before that event is published, with a short RTSP probe, so the hub is not waiting on a cold ffmpeg launch. While Secure Video stays enabled the encoder keeps a 4 second prebuffer for the next event.
