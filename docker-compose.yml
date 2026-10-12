@@ -1,5 +1,9 @@
-# Host networking is required so HomeKit can discover the accessories via mDNS.
-# /dev/dri is AMD + Intel. NVIDIA also needs docker-compose.nvidia.yml.
+# File format 2.4 is the newest docker-compose 1.25.0 accepts that still
+# allows group_add. Host networking is required so HomeKit can discover the
+# accessories via mDNS. /dev/dri is AMD + Intel. NVIDIA also needs
+# docker-compose.nvidia.yml.
+
+version: "2.4"
 
 services:
   reolink-hksv:
