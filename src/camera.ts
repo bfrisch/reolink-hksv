@@ -32,7 +32,7 @@ import {
 } from "hap-nodejs";
 import type { AppConfig, CameraConfig } from "./config.js";
 import type { AccelKind, FfmpegCaps } from "./ffmpeg.js";
-import { ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, srtpParam } from "./ffmpeg.js";
+import { ffmpegExitDetail, ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, srtpParam } from "./ffmpeg.js";
 import type { AccessoryIdentity } from "./identities.js";
 import { log } from "./logger.js";
 import { RecordingPrebuffer } from "./prebuffer.js";
@@ -53,9 +53,21 @@ type SessionInfo = {
 };
 
 type OngoingSession = {
-  process: ChildProcess;
+  process?: ChildProcess;
   localVideoPort: number;
   localAudioPort: number;
+  /** ffmpeg argv, kept so a crashed process can be started again. */
+  args: string[];
+  /** Set before kill so the exit handler does not schedule another spawn. */
+  stopping: boolean;
+  /** Delayed respawn after an unexpected exit. Cleared by stopLive. */
+  restartTimer?: NodeJS.Timeout;
+  /** Spawn failed (missing binary). Do not restart. */
+  spawnFailed?: boolean;
+  /** Tell HomeKit the live stream is up. Called at most once. */
+  markStarted?: () => void;
+  /** Tell HomeKit the live stream failed to start. Called at most once. */
+  failStart?: (err: Error) => void;
 };
 
 const usedPorts = new Set<number>();
@@ -208,8 +220,8 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   async unpublish(): Promise<void> {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.prebuffer.stop();
-    for (const session of Object.values(this.ongoing)) {
-      session.process.kill("SIGKILL");
+    for (const sessionId of Object.keys(this.ongoing)) {
+      this.stopLive(sessionId);
     }
     await this.accessory.unpublish();
   }
@@ -403,45 +415,86 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
       log.info(`${this.cam.name}: ffmpeg ${args.join(" ")}`);
     }
 
-    const child = spawn(this.app.ffmpegPath, args, { env: process.env });
     let started = false;
-    child.stderr?.on("data", (d: Buffer) => {
-      if (this.app.verboseFfmpeg) process.stderr.write(d);
-      if (!started) {
-        started = true;
-        callback();
-      }
-    });
-    child.on("error", (err) => {
-      log.error(`${this.cam.name}: ffmpeg failed: ${err.message}`);
-      if (!started) callback(err);
-    });
-    child.on("exit", (code, signal) => {
-      if (!started) callback(new Error(`ffmpeg exited ${code}/${signal}`));
-      else if (code && code !== 255) this.controller.forceStopStreamingSession(request.sessionID);
-    });
+    const markStarted = () => {
+      if (started) return;
+      started = true;
+      callback();
+    };
+    const failStart = (err: Error) => {
+      if (started) return;
+      started = true;
+      callback(err);
+    };
 
     this.ongoing[request.sessionID] = {
-      process: child,
       localVideoPort: session.localVideoPort,
       localAudioPort: session.localAudioPort,
+      args,
+      stopping: false,
+      markStarted,
+      failStart,
     };
     delete this.pending[request.sessionID];
+    this.spawnLive(request.sessionID);
 
-    setTimeout(() => {
-      if (!started) {
-        started = true;
-        callback();
-      }
-    }, 1500);
+    // HomeKit is waiting on this callback. Answer even if ffmpeg has not written stderr yet.
+    setTimeout(markStarted, 1500);
   }
 
+  /**
+   * Spawn ffmpeg for an active live session.
+   * If that process exits on its own, log the error and start it again.
+   */
+  private spawnLive(sessionId: string): void {
+    const session = this.ongoing[sessionId];
+    if (!session || session.stopping) return;
+
+    const child = spawn(this.app.ffmpegPath, session.args, { env: process.env });
+    session.process = child;
+    // Kept for the exit log. Verbose mode also writes this to stderr.
+    let stderrTail = "";
+    child.stderr?.on("data", (d: Buffer) => {
+      stderrTail = (stderrTail + d.toString()).slice(-2000);
+      if (this.app.verboseFfmpeg) process.stderr.write(d);
+      session.markStarted?.();
+    });
+    child.on("error", (err) => {
+      session.spawnFailed = true;
+      log.error(`${this.cam.name}: ffmpeg failed: ${err.message}`);
+      session.failStart?.(err);
+    });
+    child.on("exit", (code, signal) => {
+      const current = this.ongoing[sessionId];
+      // A stopped session, a replaced child, or a failed spawn should not come back.
+      if (!current || current.stopping || current.process !== child || current.spawnFailed) {
+        if (!current?.spawnFailed) current?.failStart?.(new Error(`ffmpeg exited ${code}/${signal}`));
+        return;
+      }
+      log.error(
+        `${this.cam.name}: ffmpeg exited (${code}/${signal})${ffmpegExitDetail(stderrTail)}; restarting`,
+      );
+      current.restartTimer = setTimeout(() => {
+        current.restartTimer = undefined;
+        if (current.stopping || current.spawnFailed || this.ongoing[sessionId] !== current) return;
+        this.spawnLive(sessionId);
+      }, 1000);
+    });
+  }
+
+  /** End a live session and cancel any pending ffmpeg restart. */
   private stopLive(sessionId: string): void {
     const session = this.ongoing[sessionId];
     if (!session) return;
+    session.stopping = true;
+    if (session.restartTimer) clearTimeout(session.restartTimer);
     usedPorts.delete(session.localVideoPort);
     usedPorts.delete(session.localAudioPort);
-    session.process.kill("SIGKILL");
+    const child = session.process;
+    // A dead pid can be reused; only signal a process that is still running.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
     delete this.ongoing[sessionId];
   }
 

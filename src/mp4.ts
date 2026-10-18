@@ -14,7 +14,14 @@ export class Mp4StreamingServer {
   socket?: Socket;
   childProcess?: ChildProcess;
   destroyed = false;
+  /** Set when the ffmpeg process has exited, including an intentional kill. */
+  exited = false;
+  exitCode: number | null = null;
+  exitSignal: NodeJS.Signals | null = null;
+  /** Rolling stderr, so an exit log can include ffmpeg's last line. */
+  stderrTail = "";
   private connectResolve?: () => void;
+  private connectReject?: (err: Error) => void;
   private readonly connectPromise: Promise<void>;
 
   constructor(
@@ -22,9 +29,12 @@ export class Mp4StreamingServer {
     private readonly args: string[],
     private readonly verbose: boolean,
   ) {
-    this.connectPromise = new Promise((resolve) => {
+    this.connectPromise = new Promise((resolve, reject) => {
       this.connectResolve = resolve;
+      this.connectReject = reject;
     });
+    // consume() may not be awaiting yet if ffmpeg exits during startup.
+    void this.connectPromise.catch(() => undefined);
     this.server = createServer((socket) => this.handleConnection(socket));
   }
 
@@ -42,18 +52,37 @@ export class Mp4StreamingServer {
 
     this.childProcess = spawn(this.ffmpegPath, args, {
       env: process.env,
-      stdio: ["ignore", this.verbose ? "pipe" : "ignore", this.verbose ? "pipe" : "ignore"],
+      // stderr stays a pipe so the exit log has ffmpeg's last line when verbose is off.
+      stdio: ["ignore", this.verbose ? "pipe" : "ignore", "pipe"],
     });
     if (this.verbose) {
       this.childProcess.stdout?.on("data", (d: Buffer) => process.stdout.write(d));
-      this.childProcess.stderr?.on("data", (d: Buffer) => process.stderr.write(d));
     }
+    this.childProcess.stderr?.on("data", (d: Buffer) => {
+      this.stderrTail = (this.stderrTail + d.toString()).slice(-2000);
+      if (this.verbose) process.stderr.write(d);
+    });
+    this.childProcess.on("exit", (code, signal) => {
+      this.exited = true;
+      this.exitCode = code;
+      this.exitSignal = signal;
+      if (this.destroyed) return;
+      // An exit before the TCP accept leaves the reader blocked forever.
+      this.connectReject?.(new Error(`ffmpeg exited ${code}/${signal}`));
+      this.socket?.destroy();
+    });
   }
 
   destroy(): void {
     this.destroyed = true;
+    // Unblock a reader still waiting for the first TCP connection.
+    this.connectReject?.(new Error("ffmpeg closed the fMP4 socket"));
     this.socket?.destroy();
-    this.childProcess?.kill("SIGKILL");
+    try {
+      this.childProcess?.kill("SIGKILL");
+    } catch {
+      // already gone, or the process could not be signalled
+    }
     try {
       this.server.close();
     } catch {

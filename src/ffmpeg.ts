@@ -444,6 +444,16 @@ export function sanitizeUrl(url: string): string {
   return url.replace(/:[^:@/]+@/, ":****@");
 }
 
+/** Last ffmpeg stderr line, for an exit log. Empty when ffmpeg wrote nothing. */
+export function ffmpegExitDetail(stderr: string): string {
+  const line = stderr
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .at(-1);
+  return line ? `: ${line}` : "";
+}
+
 async function run(bin: string, args: string[]): Promise<string> {
   const child = spawn(bin, args, { env: process.env });
   let out = "";
