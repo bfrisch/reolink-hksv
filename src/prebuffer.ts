@@ -2,7 +2,7 @@ import type { CameraRecordingConfiguration } from "hap-nodejs";
 import { AudioRecordingCodecType, AudioRecordingSamplerate, H264Level, H264Profile, VideoCodecType } from "hap-nodejs";
 import type { AppConfig, CameraConfig } from "./config.js";
 import type { AccelKind, FfmpegCaps } from "./ffmpeg.js";
-import { chooseRecordingStartup, ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, type RecordingStartup } from "./ffmpeg.js";
+import { chooseRecordingStartup, ffmpegExitDetail, ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, type RecordingStartup } from "./ffmpeg.js";
 import { log } from "./logger.js";
 import { Mp4StreamingServer } from "./mp4.js";
 
@@ -171,6 +171,7 @@ export class RecordingPrebuffer {
   private async consume(server: Mp4StreamingServer, startup: RecordingStartup, session: number): Promise<void> {
     const pending: Buffer[] = [];
     let gotInit = false;
+    let consumeError: unknown;
     // empty_moov is written as soon as the demuxer finishes probing. If that never happens, abandon
     // the short probe instead of leaving the hub waiting on a silent encoder.
     const deadline =
@@ -202,9 +203,7 @@ export class RecordingPrebuffer {
         this.emit({ init: false, data: fragment });
       }
     } catch (err) {
-      if (!server.destroyed && session === this.session) {
-        log.warn(`${this.cam.name}: recording encoder stopped: ${String(err)}`);
-      }
+      consumeError = err;
     } finally {
       if (deadline) clearTimeout(deadline);
       if (this.server === server) this.pipelineOpen = false;
@@ -212,11 +211,31 @@ export class RecordingPrebuffer {
 
     if (session !== this.session || this.stopped || !this.config) return;
 
+    // ffmpeg closes the fMP4 socket before the child "exit" event is delivered, so a crash
+    // still looks like a generic socket stop until the process is reaped.
+    if (consumeError && !server.destroyed && !server.exited) {
+      await server.waitForExit(1_000);
+    }
+    if (session !== this.session || this.stopped || !this.config) return;
+
+    // A kill we requested sets destroyed. An exit without that is a crash and should restart.
+    const unexpectedExit = server.exited && !server.destroyed;
+    if (unexpectedExit) {
+      log.error(
+        `${this.cam.name}: ffmpeg exited (${server.exitCode}/${server.exitSignal})${ffmpegExitDetail(server.stderrTail)}; restarting`,
+      );
+    } else if (consumeError && !server.destroyed) {
+      log.warn(`${this.cam.name}: recording encoder stopped: ${String(consumeError)}`);
+    }
+
     const next = chooseRecordingStartup(startup, gotInit);
     const giveUpFast = next !== startup;
     this.preferFastStart = next === "fast";
     if (giveUpFast) {
-      log.warn(`${this.cam.name}: recording stream produced no media with a short probe; retrying`);
+      // The process already exited; the short-probe warning would describe the wrong cause.
+      if (!unexpectedExit) {
+        log.warn(`${this.cam.name}: recording stream produced no media with a short probe; retrying`);
+      }
       try {
         await this.enqueue(async () => {
           if (this.stopped || !this.config || this.isRunning()) return;

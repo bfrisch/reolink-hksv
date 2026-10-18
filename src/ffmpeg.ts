@@ -441,7 +441,18 @@ export async function resolveRtspUrl(ffmpegPath: string, cam: CameraConfig): Pro
 }
 
 export function sanitizeUrl(url: string): string {
-  return url.replace(/:[^:@/]+@/, ":****@");
+  return url.replace(/:[^:@/]+@/g, ":****@");
+}
+
+/** Last ffmpeg stderr line, for an exit log. Empty when ffmpeg wrote nothing. */
+export function ffmpegExitDetail(stderr: string): string {
+  const line = stderr
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .at(-1);
+  // Connection errors include the input URL. Redact it before the always-on exit log.
+  return line ? `: ${sanitizeUrl(line)}` : "";
 }
 
 async function run(bin: string, args: string[]): Promise<string> {
