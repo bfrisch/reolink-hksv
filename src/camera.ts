@@ -36,7 +36,7 @@ import { ffmpegInputArgs, h264EncodeArgs, makeTranscodeOpts, srtpParam } from ".
 import type { AccessoryIdentity } from "./identities.js";
 import { log } from "./logger.js";
 import { RecordingPrebuffer } from "./prebuffer.js";
-import { type DevInfo, ReolinkClient } from "./reolink.js";
+import { type DevInfo, parseFirmwareRevision, ReolinkClient } from "./reolink.js";
 
 type SessionInfo = {
   address: string;
@@ -181,9 +181,14 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   /** Apply camera identity fields from Reolink `GetDevInfo` (e.g. firmware). */
   applyDeviceInfo(info: DevInfo): void {
     const service = this.accessory.getService(Service.AccessoryInformation)!;
-    if (typeof info.firmVer === "string" && info.firmVer.length > 0) {
-      service.updateCharacteristic(Characteristic.FirmwareRevision, info.firmVer);
+    if (typeof info.firmVer !== "string" || info.firmVer.length === 0) return;
+    const revision = parseFirmwareRevision(info.firmVer);
+    if (!revision) {
+      log.warn(`${this.cam.name}: could not parse firmVer ${JSON.stringify(info.firmVer)}`);
+      return;
     }
+    service.updateCharacteristic(Characteristic.FirmwareRevision, revision);
+    log.info(`${this.cam.name}: firmware ${info.firmVer} → ${revision}`);
   }
 
   async publish(): Promise<void> {

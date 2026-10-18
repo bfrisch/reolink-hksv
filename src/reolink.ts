@@ -17,6 +17,23 @@ export type DevInfo = {
   [key: string]: unknown;
 };
 
+/**
+ * Parse Reolink `firmVer` into a HomeKit FirmwareRevision (`x[.y[.z]]`).
+ *
+ * Reolink values look like `v3.2.0.6530_2606232191` (leading `v`, a fourth
+ * build component, and a `_` date suffix). HomeKit only allows three unsigned
+ * integer components, so four-part versions become `major.minor.build`.
+ */
+export function parseFirmwareRevision(firmVer: string): string | undefined {
+  const head = firmVer.trim().replace(/^v/i, "").split(/[_\s-]/, 1)[0] ?? "";
+  const parts = head.match(/\d+/g);
+  if (!parts?.length) return undefined;
+  if (parts.length >= 4) {
+    return `${parts[0]}.${parts[1]}.${parts[3]}`;
+  }
+  return parts.slice(0, 3).join(".");
+}
+
 interface CameraResponse {
   ok: boolean;
   status: number;
