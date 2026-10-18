@@ -49,9 +49,7 @@ COPY src ./src
 
 RUN mkdir -p /app/data
 
-ENV NODE_ENV=production \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+ENV NODE_ENV=production
 
 VOLUME ["/app/data"]
 
