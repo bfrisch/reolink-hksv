@@ -23,12 +23,18 @@ export class Mp4StreamingServer {
   private connectResolve?: () => void;
   private connectReject?: (err: Error) => void;
   private readonly connectPromise: Promise<void>;
+  /** Resolved from the child "exit" handler, including an intentional kill. */
+  private readonly processExit: Promise<void>;
+  private resolveProcessExit: () => void = () => undefined;
 
   constructor(
     private readonly ffmpegPath: string,
     private readonly args: string[],
     private readonly verbose: boolean,
   ) {
+    this.processExit = new Promise((resolve) => {
+      this.resolveProcessExit = resolve;
+    });
     this.connectPromise = new Promise((resolve, reject) => {
       this.connectResolve = resolve;
       this.connectReject = reject;
@@ -66,10 +72,33 @@ export class Mp4StreamingServer {
       this.exited = true;
       this.exitCode = code;
       this.exitSignal = signal;
+      this.resolveProcessExit();
       if (this.destroyed) return;
       // An exit before the TCP accept leaves the reader blocked forever.
       this.connectReject?.(new Error(`ffmpeg exited ${code}/${signal}`));
       this.socket?.destroy();
+    });
+  }
+
+  /**
+   * Resolves when ffmpeg exits, or after `timeoutMs` if it is still running.
+   * A process that has already exited resolves immediately.
+   */
+  waitForExit(timeoutMs: number): Promise<void> {
+    if (this.exited) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      }, timeoutMs);
+      void this.processExit.then(() => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      });
     });
   }
 

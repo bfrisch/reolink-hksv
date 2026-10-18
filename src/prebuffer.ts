@@ -211,6 +211,13 @@ export class RecordingPrebuffer {
 
     if (session !== this.session || this.stopped || !this.config) return;
 
+    // ffmpeg closes the fMP4 socket before the child "exit" event is delivered, so a crash
+    // still looks like a generic socket stop until the process is reaped.
+    if (consumeError && !server.destroyed && !server.exited) {
+      await server.waitForExit(1_000);
+    }
+    if (session !== this.session || this.stopped || !this.config) return;
+
     // A kill we requested sets destroyed. An exit without that is a crash and should restart.
     const unexpectedExit = server.exited && !server.destroyed;
     if (unexpectedExit) {
