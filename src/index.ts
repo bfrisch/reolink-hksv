@@ -15,10 +15,22 @@ import { ReolinkClient } from "./reolink.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const exampleConfig = resolve(here, "../config.example.yaml");
 
+/**
+ * Stable identity key for one camera. Host, channel, and name together survive a config reorder.
+ *
+ * @param cam - camera connection settings
+ * @returns key stored in `identities.json`
+ */
 function cameraKey(cam: CameraConfig): string {
   return `${cam.host}:${cam.channel}:${cam.name}`;
 }
 
+/**
+ * Load config, probe ffmpeg, and advertise every camera as its own HomeKit accessory.
+ * A failed login unpublishes cameras that already came up, then exits with that camera's error.
+ *
+ * @param configPath - path to `config.yaml`, relative or absolute
+ */
 async function start(configPath: string): Promise<void> {
   const config = loadConfig(resolve(configPath));
   mkdirSync(config.storageDir, { recursive: true });
@@ -26,6 +38,7 @@ async function start(configPath: string): Promise<void> {
 
   const caps = await detectFfmpeg(config.ffmpegPath);
   const host = detectHostGpu();
+  // Prefer the first real render node over the conventional default when the user left it unchanged.
   if (config.vaapiDevice === "/dev/dri/renderD128" && host.renderNodes[0]) {
     config.vaapiDevice = host.renderNodes[0];
   }
@@ -60,6 +73,7 @@ async function start(configPath: string): Promise<void> {
       accessory.applyDeviceInfo(info);
       log.info(`${cam.name}: logged in (${JSON.stringify(info)})`);
     } catch (err) {
+      // Do not leave a half-started bridge advertising cameras that did log in.
       for (const published of cameras) {
         try {
           await published.unpublish();
@@ -83,6 +97,7 @@ async function start(configPath: string): Promise<void> {
     cameras.push(accessory);
   }
 
+  /** Tear down every accessory, then exit. Errors from one camera do not skip the rest. */
   const shutdown = async () => {
     log.info("shutting down");
     for (const cam of cameras) {
@@ -98,6 +113,11 @@ async function start(configPath: string): Promise<void> {
   process.on("SIGTERM", () => void shutdown());
 }
 
+/**
+ * One-shot check: log in, print device info, motion, and the RTSP URL ffmpeg settled on.
+ *
+ * @param opts - host and credentials from the `probe` command
+ */
 async function probe(opts: {
   host: string;
   username: string;

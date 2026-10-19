@@ -15,6 +15,13 @@ const caps: FfmpegCaps = {
   hevcQsv: false,
 };
 
+/**
+ * Value of an ffmpeg flag, if that flag is present.
+ *
+ * @param args - argument list from `ffmpegInputArgs`
+ * @param name - flag including the leading dash
+ * @returns the following argument, or undefined when the flag is absent
+ */
 function flag(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;

@@ -24,6 +24,9 @@ const caps: FfmpegCaps = {
 /**
  * Encoder that accepts the fMP4 socket, closes it, then exits later.
  * That is the usual order: the socket close is observable before the child exit event.
+ *
+ * @param exitDelayMs - how long the fake ffmpeg waits after closing the socket
+ * @returns the wrapper binary and the temp directory that holds it
  */
 function ffmpegThatClosesBeforeExit(exitDelayMs: number): { bin: string; dir: string } {
   const dir = mkdtempSync(path.join(tmpdir(), "prebuffer-exit-"));
@@ -47,6 +50,12 @@ socket.on("error", () => process.exit(2));
   return { bin, dir };
 }
 
+/**
+ * Start a prebuffer against the fake ffmpeg and collect the log lines from its stop path.
+ *
+ * @param exitDelayMs - delay between the socket close and the child exit
+ * @returns warn and error lines emitted while the encoder stopped
+ */
 async function recordEncoderStop(exitDelayMs: number): Promise<string[]> {
   const { bin, dir } = ffmpegThatClosesBeforeExit(exitDelayMs);
   const cam: CameraConfig = {
@@ -100,6 +109,7 @@ async function recordEncoderStop(exitDelayMs: number): Promise<string[]> {
   const origError = console.error;
   const origWarn = console.warn;
   const prebuffer = new RecordingPrebuffer(app, cam, caps, "cpu", () => false);
+  /** Capture a console line and stop the prebuffer once the encoder has logged why it died. */
   const note = (msg?: unknown, ...rest: unknown[]) => {
     const line = [msg, ...rest].map(String).join(" ");
     lines.push(line);

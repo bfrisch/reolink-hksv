@@ -13,6 +13,10 @@ export interface RecordingFragment {
 
 type Listener = (frag: RecordingFragment) => void;
 
+/**
+ * Continuous fMP4 encoder that keeps a few seconds of media ready for HomeKit Secure Video.
+ * HomeKit opens the recording stream after motion, so the prebuffer has to already be running.
+ */
 export class RecordingPrebuffer {
   private server?: Mp4StreamingServer;
   private init?: Buffer;
@@ -28,6 +32,13 @@ export class RecordingPrebuffer {
   private restartTimer?: NodeJS.Timeout;
   private tail: Promise<void> = Promise.resolve();
 
+  /**
+   * @param app - ffmpeg path and verbosity
+   * @param cam - camera whose RTSP URL is encoded
+   * @param caps - ffmpeg capabilities, including the AAC encoder
+   * @param accel - H.264 encoder family
+   * @param motion - whether motion is currently held; used to pick the restart delay
+   */
   constructor(
     private readonly app: AppConfig,
     private readonly cam: CameraConfig,
@@ -36,6 +47,12 @@ export class RecordingPrebuffer {
     private readonly motion: () => boolean,
   ) {}
 
+  /**
+   * Replace the HomeKit recording configuration and restart the encoder.
+   * `undefined` stops the pipeline, which is how recording is turned off.
+   *
+   * @param configuration - selected codecs and fragment length, or undefined to stop
+   */
   async setConfiguration(configuration: CameraRecordingConfiguration | undefined): Promise<void> {
     await this.enqueue(async () => {
       if (this.stopped) return;
@@ -67,10 +84,21 @@ export class RecordingPrebuffer {
     this.shutdownPipeline();
   }
 
+  /**
+   * Whether the current ffmpeg process is still the one this prebuffer owns.
+   *
+   * @returns true while the pipeline has been started and not destroyed
+   */
   private isRunning(): boolean {
     return this.pipelineOpen && Boolean(this.server && !this.server.destroyed);
   }
 
+  /**
+   * Run pipeline mutations one at a time. A failed task does not block the next one.
+   *
+   * @param task - work that starts, stops, or replaces the encoder
+   * @returns the task's promise, including its rejection
+   */
   private enqueue(task: () => Promise<void>): Promise<void> {
     const run = this.tail.then(task);
     this.tail = run.then(
@@ -80,12 +108,17 @@ export class RecordingPrebuffer {
     return run;
   }
 
+  /** Drop a pending restart so a shutdown cannot be undone by the timer. */
   private cancelRestart(): void {
     if (!this.restartTimer) return;
     clearTimeout(this.restartTimer);
     this.restartTimer = undefined;
   }
 
+  /**
+   * Destroy the current encoder and invalidate any consume loop still reading it.
+   * Session is incremented first so that loop observes the mismatch and exits.
+   */
   private shutdownPipeline(): void {
     this.session++;
     this.cancelRestart();
@@ -96,6 +129,11 @@ export class RecordingPrebuffer {
     this.fragments = [];
   }
 
+  /**
+   * Restart the encoder after a delay. Motion uses a short delay; a dead URL backs off.
+   *
+   * @param session - session that requested the restart; ignored if a newer shutdown happened
+   */
   private scheduleRestart(session: number): void {
     if (this.restartTimer || this.stopped) return;
     // Reconnect quickly while an event is in progress; back off otherwise so a dead URL cannot spin.
@@ -110,6 +148,10 @@ export class RecordingPrebuffer {
     }, delay);
   }
 
+  /**
+   * Replace any current encoder with a new ffmpeg process and start consuming its fMP4.
+   * The consume loop is not awaited; its exit path schedules the next attempt.
+   */
   private async startPipeline(): Promise<void> {
     if (this.stopped || !this.config) return;
     this.shutdownPipeline();
@@ -126,6 +168,7 @@ export class RecordingPrebuffer {
       if (this.server === server) this.server = undefined;
       throw err;
     }
+    // A newer shutdown won the race while ffmpeg was spawning.
     if (session !== this.session || this.stopped) {
       server.destroy();
       if (this.server === server) this.server = undefined;
@@ -138,6 +181,12 @@ export class RecordingPrebuffer {
     void this.consume(server, startup, session);
   }
 
+  /**
+   * Subscribe to init and media fragments, starting with whatever is already buffered.
+   * The generator runs until the consumer stops iterating, which drops the listener.
+   *
+   * @returns fragments, init segment first when one has already been seen
+   */
   subscribe(): AsyncGenerator<RecordingFragment> {
     const queue: RecordingFragment[] = [];
     let notify: (() => void) | undefined;
@@ -164,10 +213,22 @@ export class RecordingPrebuffer {
     })();
   }
 
+  /**
+   * Fan one fragment out to every current subscriber.
+   *
+   * @param frag - init segment or media fragment
+   */
   private emit(frag: RecordingFragment): void {
     for (const listener of this.listeners) listener(frag);
   }
 
+  /**
+   * Read fMP4 until the socket closes, then decide whether to retry or give up the short probe.
+   *
+   * @param server - ffmpeg process started for this session
+   * @param startup - probe size that process was given
+   * @param session - session id captured at start; a mismatch means we were replaced
+   */
   private async consume(server: Mp4StreamingServer, startup: RecordingStartup, session: number): Promise<void> {
     const pending: Buffer[] = [];
     let gotInit = false;
@@ -198,6 +259,7 @@ export class RecordingPrebuffer {
         }
         const now = Date.now();
         this.fragments.push({ t: now, data: fragment });
+        // Keep a little more than one fragment length so a late subscriber still gets a GOP.
         const cutoff = now - this.prebufferMs - 1000;
         this.fragments = this.fragments.filter((f) => f.t >= cutoff);
         this.emit({ init: false, data: fragment });
@@ -251,6 +313,14 @@ export class RecordingPrebuffer {
     this.scheduleRestart(session);
   }
 
+  /**
+   * Build the ffmpeg command that writes fragmented MP4 to the local TCP server.
+   * The output URL itself is appended by `Mp4StreamingServer`.
+   *
+   * @param configuration - codecs and bitrate HomeKit selected
+   * @param startup - how long ffmpeg may probe the RTSP input
+   * @returns ffmpeg arguments without the output URL
+   */
   private buildArgs(configuration: CameraRecordingConfiguration, startup: RecordingStartup): string[] {
     if (configuration.videoCodec.type !== VideoCodecType.H264) {
       throw new Error("HomeKit Secure Video requested a non-H.264 codec");
@@ -303,6 +373,13 @@ export class RecordingPrebuffer {
     ];
   }
 
+  /**
+   * AAC encode arguments for the recording configuration, or an empty list when audio is disabled.
+   * libfdk_aac is preferred because it can produce AAC-ELD; the native encoder is the fallback.
+   *
+   * @param configuration - sample rate, bitrate, and channel count from HomeKit
+   * @returns audio arguments, or `[]` when this camera has audio turned off
+   */
   private audioArgs(configuration: CameraRecordingConfiguration): string[] {
     if (!this.cam.audio) return [];
 
@@ -358,4 +435,3 @@ export class RecordingPrebuffer {
     ];
   }
 }
-
