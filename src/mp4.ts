@@ -9,6 +9,10 @@ export interface Mp4Atom {
   data: Buffer;
 }
 
+/**
+ * Local TCP server that ffmpeg writes fragmented MP4 into.
+ * One connection is accepted, then the listener closes so a second ffmpeg cannot attach.
+ */
 export class Mp4StreamingServer {
   readonly server: Server;
   socket?: Socket;
@@ -27,6 +31,11 @@ export class Mp4StreamingServer {
   private readonly processExit: Promise<void>;
   private resolveProcessExit: () => void = () => undefined;
 
+  /**
+   * @param ffmpegPath - ffmpeg binary
+   * @param args - ffmpeg arguments, without the output URL (that is appended in `start`)
+   * @param verbose - also mirror ffmpeg stdout and stderr to this process
+   */
   constructor(
     private readonly ffmpegPath: string,
     private readonly args: string[],
@@ -44,6 +53,10 @@ export class Mp4StreamingServer {
     this.server = createServer((socket) => this.handleConnection(socket));
   }
 
+  /**
+   * Listen on an ephemeral localhost port and spawn ffmpeg writing fMP4 there.
+   * Returns once the process is spawned, not once the first atom arrives.
+   */
   async start(): Promise<void> {
     const listening = once(this.server, "listening");
     this.server.listen(0, "127.0.0.1");
@@ -83,6 +96,8 @@ export class Mp4StreamingServer {
   /**
    * Resolves when ffmpeg exits, or after `timeoutMs` if it is still running.
    * A process that has already exited resolves immediately.
+   *
+   * @param timeoutMs - how long to wait for the child exit event
    */
   waitForExit(timeoutMs: number): Promise<void> {
     if (this.exited) return Promise.resolve();
@@ -102,6 +117,10 @@ export class Mp4StreamingServer {
     });
   }
 
+  /**
+   * Kill ffmpeg, close the socket, and reject anyone still waiting for the first connection.
+   * Safe to call more than once.
+   */
   destroy(): void {
     this.destroyed = true;
     // Unblock a reader still waiting for the first TCP connection.
@@ -121,12 +140,23 @@ export class Mp4StreamingServer {
     this.childProcess = undefined;
   }
 
+  /**
+   * Accept ffmpeg's single TCP connection and stop listening for more.
+   *
+   * @param socket - the connection ffmpeg just opened
+   */
   private handleConnection(socket: Socket): void {
     this.server.close();
     this.socket = socket;
     this.connectResolve?.();
   }
 
+  /**
+   * Yield fMP4 atoms until the socket closes.
+   * Each atom is an 8-byte header (big-endian size, four-character type) plus the payload.
+   *
+   * @returns atoms in the order ffmpeg writes them
+   */
   async *generator(): AsyncGenerator<Mp4Atom> {
     await this.connectPromise;
     if (!this.socket || !this.childProcess) {
@@ -141,6 +171,12 @@ export class Mp4StreamingServer {
     }
   }
 
+  /**
+   * Read exactly `length` bytes, waiting for the socket to become readable if needed.
+   *
+   * @param length - byte count; zero returns an empty buffer
+   * @returns a buffer of that length
+   */
   private async read(length: number): Promise<Buffer> {
     if (!this.socket) throw new Error("ffmpeg closed the fMP4 socket");
     if (!length) return Buffer.alloc(0);

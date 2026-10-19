@@ -49,6 +49,13 @@ const defaults = {
   audio: true,
 };
 
+/**
+ * Read `config.yaml` and fill in defaults for anything the file omits.
+ *
+ * @param path - path to the YAML config
+ * @returns fully populated application config
+ * @throws if `cameras` is missing or empty
+ */
 export function loadConfig(path: string): AppConfig {
   const raw = parse(readFileSync(path, "utf8")) as Partial<AppConfig> & {
     cameras?: Array<Partial<CameraConfig> & { name: string; host: string }>;
@@ -72,6 +79,7 @@ export function loadConfig(path: string): AppConfig {
         name: cam.name,
         host: cam.host,
         https,
+        // HTTPS cameras default to 443; plain HTTP stays on 80 unless overridden.
         port: cam.port ?? (https ? defaults.httpsPort : defaults.port),
         username: cam.username ?? "admin",
         password: String(cam.password ?? ""),
@@ -90,6 +98,15 @@ export function loadConfig(path: string): AppConfig {
   };
 }
 
+/**
+ * Reolink RTSP path for one channel and stream quality.
+ * Channel numbers in the path are 1-based even though config channels are 0-based.
+ *
+ * @param channel - 0-based NVR channel
+ * @param stream - main, sub, or ext
+ * @param kind - HEVC preview, generic preview, or H.264 preview
+ * @returns path beginning with `/`
+ */
 export function rtspPath(channel: number, stream: VideoStreamName, kind: "hevc" | "preview" | "h264"): string {
   const ch = String(channel + 1).padStart(2, "0");
   if (kind === "hevc") return `/h265Preview_${ch}_${stream}`;
@@ -97,16 +114,30 @@ export function rtspPath(channel: number, stream: VideoStreamName, kind: "hevc" 
   return `/Preview_${ch}_${stream}`;
 }
 
+/**
+ * RTSP URLs to try, in the order that matches the configured source codec.
+ * An explicit `rtspUrl` replaces the generated list.
+ *
+ * @param cam - camera connection settings
+ * @returns candidate URLs, most likely first
+ */
 export function rtspCandidates(cam: CameraConfig): string[] {
   if (cam.rtspUrl) return [cam.rtspUrl];
   const user = encodeURIComponent(cam.username);
   const pass = encodeURIComponent(cam.password);
   const origin = `rtsp://${user}:${pass}@${cam.host}:${cam.rtspPort}`;
+  // Prefer the codec the user declared, then the other Reolink path shapes.
   const kinds: Array<"hevc" | "preview" | "h264"> =
     cam.sourceCodec === "h264" ? ["h264", "preview", "hevc"] : ["hevc", "preview", "h264"];
   return kinds.map((kind) => `${origin}${rtspPath(cam.channel, cam.videoStream, kind)}`);
 }
 
+/**
+ * The first RTSP candidate, used when a probe has not yet chosen a working URL.
+ *
+ * @param cam - camera connection settings
+ * @returns a single RTSP URL
+ */
 export function defaultRtspUrl(cam: CameraConfig): string {
   return rtspCandidates(cam)[0];
 }

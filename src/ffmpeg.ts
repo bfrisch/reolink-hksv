@@ -22,6 +22,13 @@ export interface FfmpegCaps {
 
 export type StreamCodec = "hevc" | "h264" | "unknown";
 
+/**
+ * Probe ffmpeg for the encoders and decoders this bridge can use.
+ *
+ * @param ffmpegPath - ffmpeg binary, or a name on `PATH`
+ * @returns capability flags derived from `-encoders` and `-decoders`
+ * @throws when the binary cannot be executed
+ */
 export async function detectFfmpeg(ffmpegPath: string): Promise<FfmpegCaps> {
   const encoders = await run(ffmpegPath, ["-hide_banner", "-encoders"]);
   const decoders = await run(ffmpegPath, ["-hide_banner", "-decoders"]);
@@ -53,6 +60,12 @@ const PCI_NVIDIA = "0x10de";
 const PCI_AMD = "0x1002";
 const PCI_INTEL = "0x8086";
 
+/**
+ * Detect NVIDIA, AMD, and Intel GPUs from device nodes and DRM sysfs.
+ * A container can expose NVIDIA through `NVIDIA_VISIBLE_DEVICES` without a render node.
+ *
+ * @returns which vendors are present and the usable `/dev/dri/renderD*` paths
+ */
 export function detectHostGpu(): HostGpu {
   let nvidia =
     existsSync("/dev/nvidia0") ||
@@ -81,10 +94,21 @@ export function detectHostGpu(): HostGpu {
   return { nvidia, amd, intel, renderNodes };
 }
 
+/**
+ * Pick an H.264 encoder that both ffmpeg and the machine can actually use.
+ * An explicit preference is tried first, then CPU. `auto` follows the installed GPU.
+ *
+ * @param caps - encoders ffmpeg reported
+ * @param preference - user setting from config
+ * @param host - detected GPUs; probed again when omitted
+ * @returns the encoder family to pass into the ffmpeg argument builders
+ * @throws when no H.264 encoder is available
+ */
 export function selectAccel(caps: FfmpegCaps, preference: HwAccel, host = detectHostGpu()): AccelKind {
   const requested = normalizePreference(preference);
   const order: AccelKind[] = [];
 
+  /** Add a candidate once, preserving the first time it was requested. */
   const push = (kind: AccelKind) => {
     if (!order.includes(kind)) order.push(kind);
   };
@@ -117,6 +141,7 @@ export function selectAccel(caps: FfmpegCaps, preference: HwAccel, host = detect
 
   for (const kind of order) {
     if (kind === "nvenc" && caps.h264Nvenc && (requested === "nvenc" || host.nvidia || requested === "auto")) {
+      // Do not pick NVENC in auto mode just because the binary was built with it.
       if (requested === "auto" && !host.nvidia) continue;
       return "nvenc";
     }
@@ -131,6 +156,7 @@ export function selectAccel(caps: FfmpegCaps, preference: HwAccel, host = detect
     if (kind === "cpu" && caps.libx264) return "cpu";
   }
 
+  // Last chance if the ordered walk skipped a usable encoder.
   if (caps.h264Nvenc && host.nvidia) return "nvenc";
   if (caps.h264Qsv) return "qsv";
   if (caps.h264Vaapi && host.renderNodes.length) return "vaapi";
@@ -138,6 +164,12 @@ export function selectAccel(caps: FfmpegCaps, preference: HwAccel, host = detect
   throw new Error("No H.264 encoder found (need h264_nvenc, h264_vaapi, h264_qsv, or libx264)");
 }
 
+/**
+ * Map config names (`nvidia`, `amd`, `intel`, `none`) onto encoder families.
+ *
+ * @param preference - value from `hwaccel` in config
+ * @returns an encoder family, or the original value when it is already one
+ */
 function normalizePreference(preference: HwAccel): HwAccel | "auto" | "nvenc" | "vaapi" | "qsv" | "cpu" {
   if (preference === "nvidia") return "nvenc";
   if (preference === "amd") return "vaapi";
@@ -146,6 +178,12 @@ function normalizePreference(preference: HwAccel): HwAccel | "auto" | "nvenc" | 
   return preference;
 }
 
+/**
+ * Short label for logs.
+ *
+ * @param kind - selected encoder family
+ * @returns a human-readable accelerator name
+ */
 export function accelLabel(kind: AccelKind): string {
   switch (kind) {
     case "nvenc":
@@ -159,6 +197,12 @@ export function accelLabel(kind: AccelKind): string {
   }
 }
 
+/**
+ * Encode an SRTP key and salt the way ffmpeg's `-srtp_out_params` expects them.
+ *
+ * @param keyAndSalt - concatenated SRTP key and salt from HomeKit
+ * @returns base64 parameter
+ */
 export function srtpParam(keyAndSalt: Buffer): string {
   return keyAndSalt.toString("base64");
 }
@@ -185,6 +229,10 @@ export type RecordingStartup = "fast" | "stable";
 /**
  * Short probe for a recording encoder started at motion time.
  * The stable probe is the fallback when the short one never produces an init segment.
+ *
+ * @param previous - probe used by the encoder that just stopped
+ * @param producedInitialization - whether that encoder emitted an fMP4 init segment
+ * @returns the probe the next encoder should use
  */
 export function chooseRecordingStartup(previous: RecordingStartup, producedInitialization: boolean): RecordingStartup {
   if (previous === "fast" && !producedInitialization) return "stable";
@@ -197,6 +245,12 @@ const INPUT_PROBE: Record<RecordingStartup, { probesize: string; analyzeduration
   stable: { probesize: "32M", analyzeduration: "10M" },
 };
 
+/**
+ * ffmpeg arguments up to and including `-i`. Hardware decode is selected from the accelerator.
+ *
+ * @param opts - input URL, accelerator, codec, and optional recording startup
+ * @returns argument list ending with the input URL
+ */
 export function ffmpegInputArgs(
   opts: Pick<TranscodeOpts, "url" | "verbose" | "accel" | "caps" | "sourceCodec" | "vaapiDevice"> & {
     startup?: RecordingStartup;
@@ -251,6 +305,13 @@ export function ffmpegInputArgs(
   return args;
 }
 
+/**
+ * H.264 encode arguments for the selected accelerator, scaled to HomeKit's requested size.
+ * B-frames are disabled so fragments can start on the next keyframe.
+ *
+ * @param opts - resolution, bitrate, profile, and accelerator
+ * @returns ffmpeg arguments for the video encoder only
+ */
 export function h264EncodeArgs(opts: TranscodeOpts): string[] {
   const w = even(opts.width);
   const h = even(opts.height);
@@ -363,10 +424,26 @@ export function h264EncodeArgs(opts: TranscodeOpts): string[] {
   return args;
 }
 
+/**
+ * Round a dimension down to an even number. H.264 rejects odd widths and heights.
+ *
+ * @param n - pixel count from HomeKit
+ * @returns `n`, or `n - 1` when `n` is odd
+ */
 function even(n: number): number {
   return n % 2 === 0 ? n : n - 1;
 }
 
+/**
+ * Assemble transcode options from app config, the camera, and one HomeKit request.
+ *
+ * @param app - ffmpeg path, verbosity, and VAAPI device
+ * @param cam - RTSP URL and source codec
+ * @param caps - ffmpeg capabilities
+ * @param accel - encoder family already selected for this process
+ * @param extra - resolution, frame rate, bitrate, and optional GOP timing
+ * @returns options for the input and encode argument builders
+ */
 export function makeTranscodeOpts(
   app: AppConfig,
   cam: CameraConfig,
@@ -393,6 +470,13 @@ export function makeTranscodeOpts(
   };
 }
 
+/**
+ * Open an RTSP URL just long enough to read the video codec from ffmpeg's banner.
+ *
+ * @param ffmpegPath - ffmpeg binary
+ * @param url - RTSP URL, including credentials
+ * @returns `hevc`, `h264`, or `unknown` when the probe produced no video line
+ */
 export async function probeStreamCodec(ffmpegPath: string, url: string): Promise<StreamCodec> {
   const out = await run(ffmpegPath, [
     "-hide_banner",
@@ -410,6 +494,14 @@ export async function probeStreamCodec(ffmpegPath: string, url: string): Promise
   return "unknown";
 }
 
+/**
+ * Choose a working RTSP URL and remember it on the camera config.
+ * ONVIF is tried first unless the user set `rtspUrl`; generated Reolink paths are the fallback.
+ *
+ * @param ffmpegPath - ffmpeg binary used to probe each candidate
+ * @param cam - camera settings; `rtspUrl` is written when a candidate is accepted
+ * @returns the URL and the codec ffmpeg reported, or the configured codec when the probe is inconclusive
+ */
 export async function resolveRtspUrl(ffmpegPath: string, cam: CameraConfig): Promise<{ url: string; codec: StreamCodec }> {
   const manual = Boolean(cam.rtspUrl);
   if (!manual) {
@@ -434,17 +526,29 @@ export async function resolveRtspUrl(ffmpegPath: string, cam: CameraConfig): Pro
       return { url, codec };
     }
   }
+  // Every probe failed. Keep the first candidate so a later retry still has a URL.
   const fallback = candidates[0];
   log.warn(`${cam.name}: could not probe RTSP; using ${sanitizeUrl(fallback)}`);
   cam.rtspUrl = fallback;
   return { url: fallback, codec: cam.sourceCodec === "auto" ? lastCodec : cam.sourceCodec };
 }
 
+/**
+ * Replace the password in an RTSP URL so logs can include the path.
+ *
+ * @param url - URL that may contain userinfo
+ * @returns the same URL with every password replaced by `****`
+ */
 export function sanitizeUrl(url: string): string {
   return url.replace(/:[^:@/]+@/g, ":****@");
 }
 
-/** Last ffmpeg stderr line, for an exit log. Empty when ffmpeg wrote nothing. */
+/**
+ * Last ffmpeg stderr line, for an exit log. Empty when ffmpeg wrote nothing.
+ *
+ * @param stderr - rolling stderr captured from the process
+ * @returns a `: message` suffix, or `""` when there is nothing to show
+ */
 export function ffmpegExitDetail(stderr: string): string {
   const line = stderr
     .split(/\r?\n/)
@@ -455,6 +559,14 @@ export function ffmpegExitDetail(stderr: string): string {
   return line ? `: ${sanitizeUrl(line)}` : "";
 }
 
+/**
+ * Run a command to completion and return combined stdout and stderr.
+ * ffmpeg prints codec banners on stderr, so both streams are kept.
+ *
+ * @param bin - executable
+ * @param args - arguments
+ * @returns everything the process wrote
+ */
 async function run(bin: string, args: string[]): Promise<string> {
   const child = spawn(bin, args, { env: process.env });
   let out = "";

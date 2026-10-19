@@ -72,6 +72,12 @@ type OngoingSession = {
 
 const usedPorts = new Set<number>();
 
+/**
+ * Reserve a localhost RTP port that no other live session is using.
+ *
+ * @returns a port in the ephemeral range
+ * @throws when every candidate is already reserved
+ */
 function allocPort(): number {
   for (let i = 15000; i < 65000; i++) {
     if (!usedPorts.has(i)) {
@@ -82,6 +88,10 @@ function allocPort(): number {
   throw new Error("no RTP ports available");
 }
 
+/**
+ * One Reolink camera advertised as a HomeKit Secure Video accessory.
+ * Live view is SRTP from ffmpeg; recordings come from a prebuffered fMP4 encoder.
+ */
 export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraRecordingDelegate {
   readonly accessory: Accessory;
   readonly controller: CameraController;
@@ -96,6 +106,16 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   private recordingConfig?: CameraRecordingConfiguration;
   private pollTimer?: NodeJS.Timeout;
 
+  /**
+   * Build the HAP accessory, camera controller, and recording prebuffer.
+   * The accessory UUID is derived from host, channel, and name so a restart keeps the same pairing.
+   *
+   * @param app - process settings, including ffmpeg and motion timing
+   * @param cam - this camera's connection and stream settings
+   * @param identity - stable username, PIN, and setup ID
+   * @param caps - ffmpeg encoders available on this host
+   * @param accel - H.264 encoder family selected at startup
+   */
   constructor(
     private readonly app: AppConfig,
     private readonly cam: CameraConfig,
@@ -173,6 +193,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
           },
           audio: {
             codecs: {
+              // AAC-ELD needs libfdk_aac. Without it, offer AAC-LC so recording still negotiates.
               type: this.caps.libfdkAac ? AudioRecordingCodecType.AAC_ELD : AudioRecordingCodecType.AAC_LC,
               audioChannels: 1,
               samplerate: AudioRecordingSamplerate.KHZ_16,
@@ -190,7 +211,11 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     this.accessory.configureController(this.controller);
   }
 
-  /** Apply camera identity fields from Reolink `GetDevInfo` (e.g. firmware). */
+  /**
+   * Apply camera identity fields from Reolink `GetDevInfo` (e.g. firmware).
+   *
+   * @param info - device info returned by the camera
+   */
   applyDeviceInfo(info: DevInfo): void {
     const service = this.accessory.getService(Service.AccessoryInformation)!;
     if (typeof info.firmVer !== "string" || info.firmVer.length === 0) return;
@@ -203,6 +228,10 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     log.info(`${this.cam.name}: firmware ${info.firmVer} → ${revision}`);
   }
 
+  /**
+   * Advertise the accessory on the LAN and start polling for motion.
+   * The setup URI logged here is what the Home app scans.
+   */
   async publish(): Promise<void> {
     await this.accessory.publish({
       username: this.identity.username,
@@ -217,6 +246,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     );
   }
 
+  /** Stop motion polling, the recording encoder, live ffmpeg processes, and the HAP advertisement. */
   async unpublish(): Promise<void> {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.prebuffer.stop();
@@ -226,6 +256,12 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     await this.accessory.unpublish();
   }
 
+  /**
+   * Return a JPEG snapshot. The requested size is logged on failure; the camera serves its own resolution.
+   *
+   * @param request - width and height HomeKit asked for
+   * @param callback - receives the JPEG, or the error
+   */
   handleSnapshotRequest(request: SnapshotRequest, callback: SnapshotRequestCallback): void {
     void this.client
       .snapshot()
@@ -236,6 +272,12 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
       });
   }
 
+  /**
+   * Reserve local RTP ports and remember the SRTP keys until HomeKit sends START.
+   *
+   * @param request - destination address, ports, and crypto from the hub
+   * @param callback - local ports and SSRCs the hub should send RTCP to
+   */
   prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): void {
     const videoSSRC = CameraController.generateSynchronisationSource();
     const audioSSRC = CameraController.generateSynchronisationSource();
@@ -273,6 +315,12 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     callback(undefined, response);
   }
 
+  /**
+   * Start, ignore a mid-stream reconfigure, or stop the live ffmpeg process for this session.
+   *
+   * @param request - START, RECONFIGURE, or STOP
+   * @param callback - invoked once the request has been accepted or has failed
+   */
   handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback): void {
     switch (request.type) {
       case StreamRequestTypes.START:
@@ -288,12 +336,24 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     }
   }
 
+  /**
+   * HomeKit turned Secure Video recording on or off.
+   * The encoder is started only while recording is active.
+   *
+   * @param active - whether the hub wants a recording stream
+   */
   updateRecordingActive(active: boolean): void {
     this.recordingActive = active;
     log.info(`${this.cam.name}: HomeKit Secure Video recording ${active ? "enabled" : "disabled"}`);
     this.applyRecordingConfiguration(active ? this.recordingConfig : undefined);
   }
 
+  /**
+   * Store the codec selection HomeKit negotiated.
+   * The encoder is not restarted until recording is actually active.
+   *
+   * @param configuration - selected resolution and codecs, or undefined when cleared
+   */
   updateRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
     this.recordingConfig = configuration;
     // HomeKit often writes the selected configuration before Active=1. Keep it so the
@@ -302,6 +362,14 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     this.applyRecordingConfiguration(configuration);
   }
 
+  /**
+   * Stream prebuffered fMP4 to HomeKit until motion has been idle or the hub aborts.
+   * Media fragments are held back until the init segment has been sent.
+   *
+   * @param streamId - HAP recording stream id, used to abort this generator later
+   * @param signal - aborted when the hub closes the stream
+   * @returns packets, with `isLast` set once motion has been idle past `motionHoldMs`
+   */
   async *handleRecordingStreamRequest(streamId: number, signal?: AbortSignal): AsyncGenerator<RecordingPacket> {
     const abort = new AbortController();
     this.recordAbort.set(streamId, abort);
@@ -321,6 +389,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
           yield { data: frag.data, isLast: false };
           continue;
         }
+        // Fragments from before the init segment cannot be decoded on their own.
         if (!sentInit) continue;
         const idle = !this.motion && Date.now() - this.lastMotionAt > idleAfter;
         yield { data: frag.data, isLast: idle };
@@ -332,6 +401,12 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     }
   }
 
+  /**
+   * Abort an open recording generator. The prebuffer itself keeps running for the next event.
+   *
+   * @param streamId - HAP recording stream id
+   * @param reason - optional HomeKit close reason, logged when verbose
+   */
   closeRecordingStream(streamId: number, reason?: HDSProtocolSpecificErrorReason): void {
     this.recordAbort.get(streamId)?.abort();
     this.recordAbort.delete(streamId);
@@ -340,6 +415,13 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     }
   }
 
+  /**
+   * Build the SRTP ffmpeg command for a prepared session and spawn it.
+   * The HomeKit callback is answered from the first stderr line, or after 1.5s if ffmpeg stays quiet.
+   *
+   * @param request - resolution, payload types, and session id from START
+   * @param callback - success once ffmpeg is up, or an error if the session is unknown or spawn fails
+   */
   private startLive(request: Extract<StreamingRequest, { type: StreamRequestTypes.START }>, callback: StreamRequestCallback): void {
     const session = this.pending[request.sessionID];
     if (!session) {
@@ -350,6 +432,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     const video = request.video;
     const vSrtp = srtpParam(session.videoSRTP);
     const aSrtp = srtpParam(session.audioSRTP);
+    // Copy only when the camera is already H.264. HEVC still has to be transcoded for HomeKit.
     const copyOk = this.cam.liveCodec === "copy" && this.cam.sourceCodec === "h264";
     const opts = makeTranscodeOpts(this.app, this.cam, this.caps, this.accel, {
       width: video.width,
@@ -360,6 +443,7 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     const videoCodec = copyOk ? ["-codec:v", "copy"] : h264EncodeArgs(opts);
 
     const args = [
+      // A copy does not need a hardware decoder; leave the frames in software.
       ...(copyOk
         ? ffmpegInputArgs({ ...opts, accel: "cpu" })
         : ffmpegInputArgs(opts)),
@@ -416,11 +500,13 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     }
 
     let started = false;
+    /** Answer the START callback once. Later stderr or a timeout must not call it again. */
     const markStarted = () => {
       if (started) return;
       started = true;
       callback();
     };
+    /** Answer the START callback with an error, unless success was already reported. */
     const failStart = (err: Error) => {
       if (started) return;
       started = true;
@@ -445,6 +531,8 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
   /**
    * Spawn ffmpeg for an active live session.
    * If that process exits on its own, log the error and start it again.
+   *
+   * @param sessionId - HomeKit session whose argv is already stored
    */
   private spawnLive(sessionId: string): void {
     const session = this.ongoing[sessionId];
@@ -482,7 +570,11 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     });
   }
 
-  /** End a live session and cancel any pending ffmpeg restart. */
+  /**
+   * End a live session and cancel any pending ffmpeg restart.
+   *
+   * @param sessionId - HomeKit session to tear down
+   */
   private stopLive(sessionId: string): void {
     const session = this.ongoing[sessionId];
     if (!session) return;
@@ -498,7 +590,12 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     delete this.ongoing[sessionId];
   }
 
+  /**
+   * Poll the camera for motion and hold the sensor active for `motionHoldMs` after the last hit.
+   * The recording encoder is started on the rising edge, before HomeKit is notified.
+   */
   private startMotionPoll(): void {
+    /** One poll. Errors are logged and the interval keeps going. */
     const tick = async () => {
       try {
         const active = await this.client.motionActive();
@@ -529,6 +626,11 @@ export class ReolinkHomeKitCamera implements CameraStreamingDelegate, CameraReco
     this.pollTimer = setInterval(() => void tick(), this.app.motionPollMs);
   }
 
+  /**
+   * Push a recording configuration into the prebuffer. Failures are logged, not thrown to HAP.
+   *
+   * @param configuration - selected codecs, or undefined to stop the encoder
+   */
   private applyRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
     void this.prebuffer.setConfiguration(configuration).catch((err: unknown) => {
       log.warn(`${this.cam.name}: recording encoder failed to start: ${String(err)}`);

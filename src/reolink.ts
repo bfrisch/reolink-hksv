@@ -23,12 +23,17 @@ export type DevInfo = {
  * Reolink values look like `v3.2.0.6530_2606232191` (leading `v`, a fourth
  * build component, and a `_` date suffix). HomeKit only allows three unsigned
  * integer components, so four-part versions become `major.minor.build`.
+ *
+ * @param firmVer - raw firmware string from the camera
+ * @returns a HomeKit revision, or undefined when no numeric component is present
  */
 export function parseFirmwareRevision(firmVer: string): string | undefined {
+  // Drop the date suffix (`_2606232191`) and any leading "v" before splitting digits.
   const head = firmVer.trim().replace(/^v/i, "").split(/[_\s-]/, 1)[0] ?? "";
   const parts = head.match(/\d+/g);
   if (!parts?.length) return undefined;
   if (parts.length >= 4) {
+    // The third component is usually 0; the fourth is the build HomeKit should show.
     return `${parts[0]}.${parts[1]}.${parts[3]}`;
   }
   return parts.slice(0, 3).join(".");
@@ -44,6 +49,14 @@ interface CameraResponse {
 /** Local Reolink APIs often use self-signed TLS; do not reject those certs. */
 const insecureHttpsAgent = new https.Agent({ rejectUnauthorized: false });
 
+/**
+ * HTTP(S) request against the camera that buffers the whole body.
+ * Node's global fetch is avoided so a self-signed certificate can be accepted.
+ *
+ * @param url - absolute camera URL
+ * @param init - method, headers, body, and abort signal
+ * @returns status plus helpers that parse the buffered body
+ */
 async function cameraFetch(
   url: string,
   init: {
@@ -82,6 +95,7 @@ async function cameraFetch(
               return JSON.parse(buf.toString("utf8")) as unknown;
             },
             async arrayBuffer() {
+              // Slice only this response out of the underlying pool.
               return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
             },
           });
@@ -94,17 +108,31 @@ async function cameraFetch(
   });
 }
 
+/** Logged-in client for one camera's local HTTP API. */
 export class ReolinkClient {
   private token?: string;
   private tokenUntil = 0;
 
+  /**
+   * @param cam - host, credentials, channel, and optional snapshot URL
+   */
   constructor(private readonly cam: CameraConfig) {}
 
+  /**
+   * Origin of the local API, including the scheme chosen by `cam.https`.
+   *
+   * @returns `http(s)://host:port`
+   */
   private base(): string {
     const scheme = this.cam.https ? "https" : "http";
     return `${scheme}://${this.cam.host}:${this.cam.port}`;
   }
 
+  /**
+   * Log in and cache the session token until shortly before its lease ends.
+   *
+   * @throws when the camera rejects the credentials or returns no token
+   */
   async login(): Promise<void> {
     const url = `${this.base()}/cgi-bin/api.cgi?cmd=Login`;
     const body = [
@@ -127,14 +155,27 @@ export class ReolinkClient {
     }
     const lease = json[0]?.value?.Token?.leaseTime ?? 3600;
     this.token = token;
+    // Refresh a minute early so a command does not race the lease expiry.
     this.tokenUntil = Date.now() + Math.max(30, lease - 60) * 1000;
   }
 
+  /**
+   * Return a live token, logging in again when the cached one is missing or expired.
+   *
+   * @returns session token
+   */
   private async ensureToken(): Promise<string> {
     if (!this.token || Date.now() > this.tokenUntil) await this.login();
     return this.token!;
   }
 
+  /**
+   * Send one Reolink API command. A non-zero `code` clears the token so the next call logs in again.
+   *
+   * @param cmd - command name, such as `GetDevInfo`
+   * @param param - command parameters; channel is added by the caller when needed
+   * @returns the command's `value` payload
+   */
   async cmd<T = unknown>(cmd: string, param: Record<string, unknown> = {}): Promise<T> {
     const token = await this.ensureToken();
     const url = `${this.base()}/cgi-bin/api.cgi?cmd=${encodeURIComponent(cmd)}&token=${encodeURIComponent(token)}`;
@@ -154,11 +195,22 @@ export class ReolinkClient {
     return row.value as T;
   }
 
+  /**
+   * Read model, firmware, and serial information.
+   *
+   * @returns the `DevInfo` object, or the raw value if the camera omits that wrapper
+   */
   async deviceInfo(): Promise<DevInfo> {
     const value = await this.cmd<{ DevInfo?: DevInfo }>("GetDevInfo");
     return value.DevInfo ?? (value as DevInfo);
   }
 
+  /**
+   * Whether the camera currently reports motion or an AI alarm on this channel.
+   * AI state is optional; older firmware that lacks `GetAiState` still returns the motion-detection result.
+   *
+   * @returns true when any watched alarm is active
+   */
   async motionActive(): Promise<boolean> {
     try {
       const md = await this.cmd<{ state?: number }>("GetMdState", { channel: this.cam.channel });
@@ -190,6 +242,11 @@ export class ReolinkClient {
     return false;
   }
 
+  /**
+   * Download one JPEG snapshot for the configured channel.
+   *
+   * @returns raw JPEG bytes
+   */
   async snapshot(): Promise<Buffer> {
     const token = await this.ensureToken();
     const url =
